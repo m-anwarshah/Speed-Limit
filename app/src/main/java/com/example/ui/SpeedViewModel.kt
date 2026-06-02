@@ -75,6 +75,7 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
 
     private var alertActive = false
     private var toneGen: ToneGenerator? = null
+    private var alertToneJob: Job? = null
 
     private val locationRequest = LocationRequest.Builder(
         Priority.PRIORITY_HIGH_ACCURACY, 1000L
@@ -111,6 +112,9 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
         timerJob = null
         _gpsStatus.value = "Tracking paused"
         lastLocation = null // avoid a distance jump after a long pause
+        // No more speed readings will arrive while paused, so silence any active alarm.
+        alertActive = false
+        stopAlertTone()
     }
 
     fun resetTrip() {
@@ -174,29 +178,45 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun checkAlert(currentKmh: Double) {
         val limit = _speedLimit.value
-        if (limit <= 0) { stopAlertTone(); return }
 
         // Compare in the displayed unit so the limit matches what the user sees.
         val displaySpeed = if (_speedUnit.value == "mph") currentKmh * 0.621371 else currentKmh
-        val over = displaySpeed > limit
+        val over = limit > 0 && displaySpeed > limit
 
-        if (over && !alertActive) {
-            alertActive = true
-            if (_alertSoundEnabled.value) playAlertTone()
-        } else if (!over && alertActive) {
-            alertActive = false
+        alertActive = over
+
+        // Keep the alarm looping the whole time the vehicle is over the limit,
+        // and stop the moment speed drops back to/under the limit.
+        if (over && _alertSoundEnabled.value) {
+            startAlertLoop()
+        } else {
             stopAlertTone()
         }
     }
 
-    private fun playAlertTone() {
-        try {
-            if (toneGen == null) toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 80)
-            toneGen?.startTone(ToneGenerator.TONE_CDMA_HIGH_L, 600)
-        } catch (_: Exception) { }
+    private fun startAlertLoop() {
+        // Already looping — don't stack a second loop on top.
+        if (alertToneJob?.isActive == true) return
+
+        alertToneJob = viewModelScope.launch {
+            try {
+                if (toneGen == null) toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 90)
+            } catch (_: Exception) {
+                return@launch
+            }
+            // Repeat the warning beep until the loop is cancelled (speed back under limit).
+            while (true) {
+                try {
+                    toneGen?.startTone(ToneGenerator.TONE_CDMA_HIGH_L, 500)
+                } catch (_: Exception) { }
+                delay(550)
+            }
+        }
     }
 
     private fun stopAlertTone() {
+        alertToneJob?.cancel()
+        alertToneJob = null
         try {
             toneGen?.stopTone()
         } catch (_: Exception) { }
@@ -217,7 +237,12 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
     fun setAlertSoundEnabled(enabled: Boolean) {
         _alertSoundEnabled.value = enabled
         repo.saveAlertSound(enabled)
-        if (!enabled) stopAlertTone()
+        if (!enabled) {
+            stopAlertTone()
+        } else if (alertActive) {
+            // Turned the sound back on while still over the limit — resume the alarm.
+            startAlertLoop()
+        }
     }
 
     // --- Trip history ---
