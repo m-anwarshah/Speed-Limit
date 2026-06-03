@@ -1,286 +1,126 @@
 package com.example.ui
 
-import android.annotation.SuppressLint
 import android.app.Application
-import android.location.Location
-import android.media.AudioManager
-import android.media.ToneGenerator
-import android.os.Looper
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.Trip
-import com.example.data.TripRepository
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
+import com.example.service.LocationTrackingService
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
+/**
+ * Binds to LocationTrackingService and mirrors its StateFlows so the existing
+ * Compose UI keeps working unchanged. All real tracking lives in the service,
+ * which survives screen-off and app-minimized.
+ */
 class SpeedViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val repo = TripRepository(app)
-    private val fusedClient = LocationServices.getFusedLocationProviderClient(app)
+    private var service: LocationTrackingService? = null
+    private var bound = false
+    private val mirrorJobs = mutableListOf<Job>()
 
-    // --- Public state exposed to the UI ---
+    // Local mirrors the UI collects from.
     private val _isTracking = MutableStateFlow(false)
     val isTracking: StateFlow<Boolean> = _isTracking.asStateFlow()
-
     private val _currentSpeedKmh = MutableStateFlow(0.0)
     val currentSpeedKmh: StateFlow<Double> = _currentSpeedKmh.asStateFlow()
-
     private val _maxSpeedKmh = MutableStateFlow(0.0)
     val maxSpeedKmh: StateFlow<Double> = _maxSpeedKmh.asStateFlow()
-
     private val _avgSpeedKmh = MutableStateFlow(0.0)
     val avgSpeedKmh: StateFlow<Double> = _avgSpeedKmh.asStateFlow()
-
     private val _distanceKm = MutableStateFlow(0.0)
     val distanceKm: StateFlow<Double> = _distanceKm.asStateFlow()
-
     private val _durationSeconds = MutableStateFlow(0L)
     val durationSeconds: StateFlow<Long> = _durationSeconds.asStateFlow()
-
     private val _gpsStatus = MutableStateFlow("Press Start to begin GPS tracking")
     val gpsStatus: StateFlow<String> = _gpsStatus.asStateFlow()
-
-    private val _speedLimit = MutableStateFlow(repo.loadSpeedLimit())
+    private val _speedLimit = MutableStateFlow(80)
     val speedLimit: StateFlow<Int> = _speedLimit.asStateFlow()
-
-    private val _speedUnit = MutableStateFlow(repo.loadSpeedUnit())
+    private val _speedUnit = MutableStateFlow("kmh")
     val speedUnit: StateFlow<String> = _speedUnit.asStateFlow()
-
-    private val _alertSoundEnabled = MutableStateFlow(repo.loadAlertSound())
+    private val _alertSoundEnabled = MutableStateFlow(true)
     val alertSoundEnabled: StateFlow<Boolean> = _alertSoundEnabled.asStateFlow()
-
-    private val _savedTrips = MutableStateFlow(repo.loadTrips())
+    private val _savedTrips = MutableStateFlow<List<Trip>>(emptyList())
     val savedTrips: StateFlow<List<Trip>> = _savedTrips.asStateFlow()
 
-    // --- Internal trip accumulators ---
-    private var totalSpeed = 0.0
-    private var speedReadings = 0
-    private var lastLocation: Location? = null
-
-    private var startElapsed = 0L          // accumulated seconds from earlier segments
-    private var segmentStart = 0L          // wall-clock ms when current segment began
-    private var timerJob: Job? = null
-
-    private var alertActive = false
-    private var toneGen: ToneGenerator? = null
-    private var alertToneJob: Job? = null
-
-    private val locationRequest = LocationRequest.Builder(
-        Priority.PRIORITY_HIGH_ACCURACY, 1000L
-    ).setMinUpdateIntervalMillis(500L).build()
-
-    private val locationCallback = object : LocationCallback() {
-        override fun onLocationResult(result: LocationResult) {
-            result.lastLocation?.let { handleLocation(it) }
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val svc = (binder as LocationTrackingService.LocalBinder).getService()
+            service = svc
+            bound = true
+            mirror(svc)
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            bound = false
+            service = null
         }
     }
 
-    // --- Tracking control ---
-    @SuppressLint("MissingPermission")
+    init {
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, LocationTrackingService::class.java)
+        // Bind only: this creates the service so the UI can read saved trips and
+        // settings, but does NOT promote it to a foreground (location) service.
+        // Foreground start is deferred to startTracking(), i.e. until the user has
+        // granted location permission — which avoids a SecurityException/crash on
+        // Android 14+.
+        ctx.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun <T> mirrorFlow(src: StateFlow<T>, dst: MutableStateFlow<T>) {
+        mirrorJobs += viewModelScope.launch { src.collect { dst.value = it } }
+    }
+
+    private fun mirror(svc: LocationTrackingService) {
+        mirrorFlow(svc.isTracking, _isTracking)
+        mirrorFlow(svc.currentSpeedKmh, _currentSpeedKmh)
+        mirrorFlow(svc.maxSpeedKmh, _maxSpeedKmh)
+        mirrorFlow(svc.avgSpeedKmh, _avgSpeedKmh)
+        mirrorFlow(svc.distanceKm, _distanceKm)
+        mirrorFlow(svc.durationSeconds, _durationSeconds)
+        mirrorFlow(svc.gpsStatus, _gpsStatus)
+        mirrorFlow(svc.speedLimit, _speedLimit)
+        mirrorFlow(svc.speedUnit, _speedUnit)
+        mirrorFlow(svc.alertSoundEnabled, _alertSoundEnabled)
+        mirrorFlow(svc.savedTrips, _savedTrips)
+    }
+
+    // --- Pass-through actions ---
     fun startTracking() {
-        if (_isTracking.value) return
-        _isTracking.value = true
-        _gpsStatus.value = "Starting GPS..."
-
-        segmentStart = System.currentTimeMillis()
-        startTimer()
-
-        fusedClient.requestLocationUpdates(
-            locationRequest, locationCallback, Looper.getMainLooper()
-        )
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, LocationTrackingService::class.java)
+            .setAction(LocationTrackingService.ACTION_START)
+        // Permission is granted by the time this is called, so it's safe to start
+        // the foreground location service. onStartCommand begins GPS tracking, and
+        // the service then keeps running when the app is minimized.
+        ContextCompat.startForegroundService(ctx, intent)
     }
-
-    fun pauseTracking() {
-        if (!_isTracking.value) return
-        _isTracking.value = false
-        fusedClient.removeLocationUpdates(locationCallback)
-        // bank the elapsed time of this segment
-        startElapsed += (System.currentTimeMillis() - segmentStart) / 1000
-        timerJob?.cancel()
-        timerJob = null
-        _gpsStatus.value = "Tracking paused"
-        lastLocation = null // avoid a distance jump after a long pause
-        // No more speed readings will arrive while paused, so silence any active alarm.
-        alertActive = false
-        stopAlertTone()
-    }
-
-    fun resetTrip() {
-        pauseTracking()
-        _currentSpeedKmh.value = 0.0
-        _maxSpeedKmh.value = 0.0
-        _avgSpeedKmh.value = 0.0
-        _distanceKm.value = 0.0
-        _durationSeconds.value = 0L
-        totalSpeed = 0.0
-        speedReadings = 0
-        startElapsed = 0L
-        lastLocation = null
-        _gpsStatus.value = "Trip reset. Press Start to begin again."
-        stopAlertTone()
-    }
-
-    private fun startTimer() {
-        timerJob?.cancel()
-        timerJob = viewModelScope.launch {
-            while (_isTracking.value) {
-                val live = (System.currentTimeMillis() - segmentStart) / 1000
-                _durationSeconds.value = startElapsed + live
-                delay(1000)
-            }
-        }
-    }
-
-    private fun handleLocation(loc: Location) {
-        _gpsStatus.value = "GPS active | Accuracy: ${Math.round(loc.accuracy)} m"
-
-        // Speed: prefer hardware speed, fall back to distance/time.
-        var speedMps = if (loc.hasSpeed()) loc.speed.toDouble() else 0.0
-
-        lastLocation?.let { prev ->
-            val meters = prev.distanceTo(loc).toDouble()
-            val secs = (loc.time - prev.time) / 1000.0
-            if (meters > 0 && secs > 0) {
-                _distanceKm.value += meters / 1000.0
-                if (!loc.hasSpeed() || speedMps <= 0.0) {
-                    speedMps = meters / secs
-                }
-            }
-        }
-        lastLocation = loc
-
-        if (speedMps < 0) speedMps = 0.0
-        var kmh = speedMps * 3.6
-        if (kmh < 1.0) kmh = 0.0   // suppress GPS jitter at standstill
-
-        _currentSpeedKmh.value = kmh
-        if (kmh > _maxSpeedKmh.value) _maxSpeedKmh.value = kmh
-        if (kmh > 0) {
-            totalSpeed += kmh
-            speedReadings++
-            _avgSpeedKmh.value = totalSpeed / speedReadings
-        }
-
-        checkAlert(kmh)
-    }
-
-    private fun checkAlert(currentKmh: Double) {
-        val limit = _speedLimit.value
-
-        // Compare in the displayed unit so the limit matches what the user sees.
-        val displaySpeed = if (_speedUnit.value == "mph") currentKmh * 0.621371 else currentKmh
-        val over = limit > 0 && displaySpeed > limit
-
-        alertActive = over
-
-        // Keep the alarm looping the whole time the vehicle is over the limit,
-        // and stop the moment speed drops back to/under the limit.
-        if (over && _alertSoundEnabled.value) {
-            startAlertLoop()
-        } else {
-            stopAlertTone()
-        }
-    }
-
-    private fun startAlertLoop() {
-        // Already looping — don't stack a second loop on top.
-        if (alertToneJob?.isActive == true) return
-
-        alertToneJob = viewModelScope.launch {
-            try {
-                if (toneGen == null) toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 90)
-            } catch (_: Exception) {
-                return@launch
-            }
-            // Repeat the warning beep until the loop is cancelled (speed back under limit).
-            while (true) {
-                try {
-                    toneGen?.startTone(ToneGenerator.TONE_CDMA_HIGH_L, 500)
-                } catch (_: Exception) { }
-                delay(550)
-            }
-        }
-    }
-
-    private fun stopAlertTone() {
-        alertToneJob?.cancel()
-        alertToneJob = null
-        try {
-            toneGen?.stopTone()
-        } catch (_: Exception) { }
-    }
-
-    // --- Settings ---
-    fun setSpeedLimit(v: Int) {
-        val clamped = v.coerceIn(0, 400)
-        _speedLimit.value = clamped
-        repo.saveSpeedLimit(clamped)
-    }
-
-    fun setSpeedUnit(u: String) {
-        _speedUnit.value = u
-        repo.saveSpeedUnit(u)
-    }
-
-    fun setAlertSoundEnabled(enabled: Boolean) {
-        _alertSoundEnabled.value = enabled
-        repo.saveAlertSound(enabled)
-        if (!enabled) {
-            stopAlertTone()
-        } else if (alertActive) {
-            // Turned the sound back on while still over the limit — resume the alarm.
-            startAlertLoop()
-        }
-    }
-
-    // --- Trip history ---
-    fun saveTrip() {
-        if (_distanceKm.value <= 0.0 && _durationSeconds.value <= 0L) {
-            _gpsStatus.value = "Nothing to save yet."
-            return
-        }
-        val fmt = SimpleDateFormat("MMM d, yyyy  HH:mm", Locale.getDefault())
-        val trip = Trip(
-            id = System.currentTimeMillis(),
-            dateTimeString = fmt.format(Date()),
-            distanceKm = _distanceKm.value,
-            maxSpeedKmh = _maxSpeedKmh.value,
-            avgSpeedKmh = _avgSpeedKmh.value,
-            durationSeconds = _durationSeconds.value
-        )
-        val updated = (listOf(trip) + _savedTrips.value).take(50)
-        _savedTrips.value = updated
-        repo.saveTrips(updated)
-        _gpsStatus.value = "Trip saved successfully."
-    }
-
-    fun deleteTrip(trip: Trip) {
-        val updated = _savedTrips.value.filter { it.id != trip.id }
-        _savedTrips.value = updated
-        repo.saveTrips(updated)
-    }
-
-    fun clearAllTrips() {
-        _savedTrips.value = emptyList()
-        repo.saveTrips(emptyList())
-    }
+    fun pauseTracking() { service?.pauseTracking() }
+    fun resetTrip() { service?.resetTrip() }
+    fun setSpeedLimit(v: Int) { service?.setSpeedLimit(v) }
+    fun setSpeedUnit(u: String) { service?.setSpeedUnit(u) }
+    fun setAlertSoundEnabled(e: Boolean) { service?.setAlertSoundEnabled(e) }
+    fun saveTrip() { service?.saveTrip() }
+    fun deleteTrip(trip: Trip) { service?.deleteTrip(trip) }
+    fun clearAllTrips() { service?.clearAllTrips() }
 
     override fun onCleared() {
         super.onCleared()
-        fusedClient.removeLocationUpdates(locationCallback)
-        timerJob?.cancel()
-        toneGen?.release()
+        mirrorJobs.forEach { it.cancel() }
+        if (bound) {
+            try { getApplication<Application>().unbindService(connection) } catch (_: Exception) {}
+            bound = false
+        }
+        // Note: we do NOT stop the service here, so tracking continues
+        // when the activity is destroyed/minimized.
     }
 }

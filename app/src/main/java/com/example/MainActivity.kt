@@ -1,8 +1,12 @@
 package com.example
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -37,7 +41,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.Trip
@@ -74,6 +82,7 @@ fun SpeedometerAppRoot(
 ) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
+    val leftScrollState = rememberScrollState()
 
     var hasPermission by remember {
         mutableStateOf(
@@ -86,17 +95,68 @@ fun SpeedometerAppRoot(
         )
     }
 
+    // True once the user has chosen "Don't ask again" — the system dialog will no
+    // longer appear, so we must send them to Settings instead.
+    var permanentlyDenied by remember { mutableStateOf(false) }
+
     val launcher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         hasPermission = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
                         permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (hasPermission) {
+            permanentlyDenied = false
             viewModel.startTracking()
+        } else {
+            // After a denial, if the system says we can no longer show a rationale,
+            // the user picked "Don't ask again" → treat as permanently denied.
+            val act = context as? Activity
+            val canAskAgain = act != null && (
+                ActivityCompat.shouldShowRequestPermissionRationale(
+                    act, Manifest.permission.ACCESS_FINE_LOCATION
+                ) || ActivityCompat.shouldShowRequestPermissionRationale(
+                    act, Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
+            permanentlyDenied = !canAskAgain
         }
     }
 
-    Box(
+    // Re-check permission whenever the screen returns to the foreground, so the
+    // "GPS Location Required" overlay clears itself if the user granted location
+    // from system Settings (otherwise it would stay stuck forever).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val granted =
+                    ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.ACCESS_FINE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(
+                        context, Manifest.permission.ACCESS_COARSE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
+                hasPermission = granted
+                if (granted) permanentlyDenied = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Location + (on Android 13+) notification permission for the foreground service.
+    val requestedPermissions = remember {
+        val list = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            list.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        list.toTypedArray()
+    }
+
+    BoxWithConstraints(
         modifier = modifier
             .background(
                 Brush.verticalGradient(
@@ -105,14 +165,32 @@ fun SpeedometerAppRoot(
             )
             .padding(horizontal = 16.dp)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(scrollState),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(modifier = Modifier.height(16.dp))
+        // Wide = car infotainment screen or a phone turned sideways.
+        val isWide = maxWidth >= 600.dp
 
+        val isTracking by viewModel.isTracking.collectAsStateWithLifecycle()
+        val currentSpeedKmh by viewModel.currentSpeedKmh.collectAsStateWithLifecycle()
+        val maxSpeedKmh by viewModel.maxSpeedKmh.collectAsStateWithLifecycle()
+        val avgSpeedKmh by viewModel.avgSpeedKmh.collectAsStateWithLifecycle()
+        val distanceKm by viewModel.distanceKm.collectAsStateWithLifecycle()
+        val durationSeconds by viewModel.durationSeconds.collectAsStateWithLifecycle()
+        val gpsStatus by viewModel.gpsStatus.collectAsStateWithLifecycle()
+        val speedLimit by viewModel.speedLimit.collectAsStateWithLifecycle()
+        val speedUnit by viewModel.speedUnit.collectAsStateWithLifecycle()
+        val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
+        val alertSoundEnabled by viewModel.alertSoundEnabled.collectAsStateWithLifecycle()
+
+        val isMph = speedUnit == "mph"
+        val displaySpeed = if (isMph) currentSpeedKmh * 0.621371 else currentSpeedKmh
+        val displayMax = if (isMph) maxSpeedKmh * 0.621371 else maxSpeedKmh
+        val displayAvg = if (isMph) avgSpeedKmh * 0.621371 else avgSpeedKmh
+        val displayDistance = if (isMph) distanceKm * 0.621371 else distanceKm
+        val distanceUnitLabel = if (isMph) "mi" else "km"
+        val speedUnitLabel = if (isMph) "mph" else "km/h"
+        val isAlertTriggered = speedLimit > 0 && displaySpeed > speedLimit.toDouble()
+
+        // --- Reusable content blocks so both layouts share the same pieces ---
+        val header: @Composable () -> Unit = {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.Center,
@@ -134,45 +212,17 @@ fun SpeedometerAppRoot(
                     modifier = Modifier.testTag("app_title")
                 )
             }
-            Text(
-                text = "GPS speed of the vehicle you are sitting in",
-                color = TextMuted,
-                fontSize = 13.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier
-                    .padding(top = 4.dp, bottom = 20.dp)
-                    .testTag("app_subtitle")
-            )
+        }
 
-            val isTracking by viewModel.isTracking.collectAsStateWithLifecycle()
-            val currentSpeedKmh by viewModel.currentSpeedKmh.collectAsStateWithLifecycle()
-            val maxSpeedKmh by viewModel.maxSpeedKmh.collectAsStateWithLifecycle()
-            val avgSpeedKmh by viewModel.avgSpeedKmh.collectAsStateWithLifecycle()
-            val distanceKm by viewModel.distanceKm.collectAsStateWithLifecycle()
-            val durationSeconds by viewModel.durationSeconds.collectAsStateWithLifecycle()
-            val gpsStatus by viewModel.gpsStatus.collectAsStateWithLifecycle()
-            val speedLimit by viewModel.speedLimit.collectAsStateWithLifecycle()
-            val speedUnit by viewModel.speedUnit.collectAsStateWithLifecycle()
-            val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
-
-            val isMph = speedUnit == "mph"
-            val displaySpeed = if (isMph) currentSpeedKmh * 0.621371 else currentSpeedKmh
-            val displayMax = if (isMph) maxSpeedKmh * 0.621371 else maxSpeedKmh
-            val displayAvg = if (isMph) avgSpeedKmh * 0.621371 else avgSpeedKmh
-            val displayDistance = if (isMph) distanceKm * 0.621371 else distanceKm
-            val distanceUnitLabel = if (isMph) "mi" else "km"
-            val speedUnitLabel = if (isMph) "mph" else "km/h"
-
+        val speedBlock: @Composable () -> Unit = {
             SpeedDisplayCard(
                 speed = displaySpeed,
                 unit = speedUnitLabel,
                 gpsStatus = gpsStatus,
                 isTracking = isTracking,
+                bigMode = isWide,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
-
-            val isAlertTriggered = speedLimit > 0 && displaySpeed > speedLimit.toDouble()
-
             AnimatedVisibility(
                 visible = isAlertTriggered,
                 enter = expandVertically() + fadeIn(),
@@ -184,7 +234,9 @@ fun SpeedometerAppRoot(
                     modifier = Modifier.padding(bottom = 16.dp)
                 )
             }
+        }
 
+        val telemetryBlock: @Composable () -> Unit = {
             TelemetryGrid(
                 maxSpeed = displayMax,
                 avgSpeed = displayAvg,
@@ -194,34 +246,19 @@ fun SpeedometerAppRoot(
                 durationSeconds = durationSeconds,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
+        }
 
-            val alertSoundEnabled by viewModel.alertSoundEnabled.collectAsStateWithLifecycle()
-            SettingsCard(
-                speedLimit = speedLimit,
-                speedUnit = speedUnit,
-                alertSoundEnabled = alertSoundEnabled,
-                onLimitChange = { viewModel.setSpeedLimit(it) },
-                onUnitChange = { viewModel.setSpeedUnit(it) },
-                onAlertSoundToggle = { viewModel.setAlertSoundEnabled(it) },
-                modifier = Modifier.padding(bottom = 18.dp)
-            )
-
+        val controlsBlock: @Composable () -> Unit = {
             ControlsRow(
                 isTracking = isTracking,
                 hasPermission = hasPermission,
                 onRequestPermissions = {
-                    launcher.launch(
-                        arrayOf(
-                            Manifest.permission.ACCESS_FINE_LOCATION,
-                            Manifest.permission.ACCESS_COARSE_LOCATION
-                        )
-                    )
+                    launcher.launch(requestedPermissions)
                 },
                 onStart = { viewModel.startTracking() },
                 onPause = { viewModel.pauseTracking() },
                 modifier = Modifier.padding(bottom = 12.dp)
             )
-
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -245,7 +282,6 @@ fun SpeedometerAppRoot(
                     Spacer(modifier = Modifier.width(6.dp))
                     Text("Reset Trip", fontWeight = FontWeight.Bold)
                 }
-
                 Button(
                     onClick = { viewModel.saveTrip() },
                     colors = ButtonDefaults.buttonColors(
@@ -263,7 +299,21 @@ fun SpeedometerAppRoot(
                     Text("Save Trip", fontWeight = FontWeight.Bold)
                 }
             }
+        }
 
+        val settingsBlock: @Composable () -> Unit = {
+            SettingsCard(
+                speedLimit = speedLimit,
+                speedUnit = speedUnit,
+                alertSoundEnabled = alertSoundEnabled,
+                onLimitChange = { viewModel.setSpeedLimit(it) },
+                onUnitChange = { viewModel.setSpeedUnit(it) },
+                onAlertSoundToggle = { viewModel.setAlertSoundEnabled(it) },
+                modifier = Modifier.padding(bottom = 18.dp)
+            )
+        }
+
+        val historyBlock: @Composable () -> Unit = {
             SavedTripsHistoryList(
                 trips = savedTrips,
                 isMph = isMph,
@@ -271,7 +321,9 @@ fun SpeedometerAppRoot(
                 onClearAll = { viewModel.clearAllTrips() },
                 modifier = Modifier.padding(bottom = 20.dp)
             )
+        }
 
+        val footer: @Composable () -> Unit = {
             Text(
                 text = "Use on a real mobile device with GPS receiver enabled. Precise speed measure requires satellite connection outdoors. For safety, do not operate the app while driving.",
                 color = TextMuted,
@@ -283,6 +335,67 @@ fun SpeedometerAppRoot(
                     .padding(bottom = 32.dp)
                     .testTag("safety_disclaimer")
             )
+        }
+
+        if (isWide) {
+            // WIDE / CAR LAYOUT: speed on the left, everything else scrolls on the right.
+            Row(
+                modifier = Modifier.fillMaxSize(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(leftScrollState),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    speedBlock()
+                    controlsBlock()
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .verticalScroll(scrollState),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    telemetryBlock()
+                    settingsBlock()
+                    historyBlock()
+                    footer()
+                }
+            }
+        } else {
+            // NARROW / PHONE PORTRAIT LAYOUT: single scrolling column.
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(scrollState),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Spacer(modifier = Modifier.height(16.dp))
+                header()
+                Text(
+                    text = "GPS speed of the vehicle you are sitting in",
+                    color = TextMuted,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier
+                        .padding(top = 4.dp, bottom = 20.dp)
+                        .testTag("app_subtitle")
+                )
+                speedBlock()
+                telemetryBlock()
+                settingsBlock()
+                controlsBlock()
+                historyBlock()
+                footer()
+            }
         }
 
         if (!hasPermission) {
@@ -320,7 +433,10 @@ fun SpeedometerAppRoot(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Speed Meter uses the device's internal GPS hardware receiver to capture accurate speed recordings without mobile internet. Please accept location permissions to proceed.",
+                            text = if (permanentlyDenied)
+                                "Location permission is currently blocked. Please enable it for Speed Meter in system Settings, then return to the app."
+                            else
+                                "Speed Meter uses the device's internal GPS hardware receiver to capture accurate speed recordings without mobile internet. Please accept location permissions to proceed.",
                             color = TextMuted,
                             fontSize = 13.sp,
                             lineHeight = 18.sp,
@@ -329,12 +445,18 @@ fun SpeedometerAppRoot(
                         Spacer(modifier = Modifier.height(24.dp))
                         Button(
                             onClick = {
-                                launcher.launch(
-                                    arrayOf(
-                                        Manifest.permission.ACCESS_FINE_LOCATION,
-                                        Manifest.permission.ACCESS_COARSE_LOCATION
+                                if (permanentlyDenied) {
+                                    // The dialog won't appear anymore — open this app's
+                                    // settings page so the user can enable it manually.
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.fromParts("package", context.packageName, null)
+                                        )
                                     )
-                                )
+                                } else {
+                                    launcher.launch(requestedPermissions)
+                                }
                             },
                             colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = SlateDark),
                             modifier = Modifier
@@ -343,7 +465,10 @@ fun SpeedometerAppRoot(
                                 .testTag("request_permission_button"),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Text("Grant Location Permissions", fontWeight = FontWeight.Bold)
+                            Text(
+                                if (permanentlyDenied) "Open Settings" else "Grant Location Permissions",
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -358,6 +483,7 @@ fun SpeedDisplayCard(
     unit: String,
     gpsStatus: String,
     isTracking: Boolean,
+    bigMode: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -370,14 +496,14 @@ fun SpeedDisplayCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 28.dp, horizontal = 16.dp),
+                .padding(vertical = if (bigMode) 40.dp else 28.dp, horizontal = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             val roundedSpeed = Math.round(speed).toInt()
             Text(
                 text = "$roundedSpeed",
                 color = if (roundedSpeed > 0) AccentGreen else TextWhite,
-                fontSize = 84.sp,
+                fontSize = if (bigMode) 140.sp else 84.sp,
                 fontWeight = FontWeight.Black,
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier.testTag("current_speed_value")
@@ -688,7 +814,7 @@ fun SettingsCard(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 IconButton(
-                    onClick = { if (speedLimit > 5) onLimitChange(speedLimit - 5) },
+                    onClick = { if (speedLimit > 2) onLimitChange(speedLimit - 2) },
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)
@@ -710,7 +836,7 @@ fun SettingsCard(
                 )
 
                 IconButton(
-                    onClick = { onLimitChange(speedLimit + 5) },
+                    onClick = { onLimitChange(speedLimit + 2) },
                     modifier = Modifier
                         .size(40.dp)
                         .clip(CircleShape)

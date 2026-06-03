@@ -8,7 +8,7 @@ android {
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.speedmeter"
+        applicationId = "com.speedmeter.gps"
         minSdk = 24
         targetSdk = 34
         versionCode = 1
@@ -18,6 +18,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Sign the release build with the debug key so the APK is directly
+            // installable for personal sideloading. Before publishing to the Play
+            // Store, replace this with your own release keystore/signing config.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
