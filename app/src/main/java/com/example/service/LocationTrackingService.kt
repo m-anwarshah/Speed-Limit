@@ -20,6 +20,7 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.Trip
+import com.example.data.OsmRepository
 import com.example.data.TripRepository
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -72,6 +73,12 @@ class LocationTrackingService : Service() {
     val alertSoundEnabled = MutableStateFlow(true)
     val savedTrips = MutableStateFlow<List<Trip>>(emptyList())
 
+    // --- Road context from OpenStreetMap (empty / -1 mean "unknown") ---
+    val roadName = MutableStateFlow("")
+    val roadMaxSpeedKmh = MutableStateFlow(-1.0)
+    val restAreaName = MutableStateFlow("")
+    val restAreaDistanceKm = MutableStateFlow(-1.0)
+
     // --- Internal accumulators ---
     private var totalSpeed = 0.0
     private var speedReadings = 0
@@ -80,9 +87,12 @@ class LocationTrackingService : Service() {
     private var startElapsed = 0L
     private var segmentStart = 0L
     private var timerJob: Job? = null
+    private var infoJob: Job? = null
     private var alertActive = false
     private var alertJob: Job? = null
     private var toneGen: ToneGenerator? = null
+
+    private val osm = OsmRepository()
 
     private val locationRequest = LocationRequest.Builder(
         Priority.PRIORITY_HIGH_ACCURACY, 1000L
@@ -130,6 +140,7 @@ class LocationTrackingService : Service() {
 
         segmentStart = SystemClock.elapsedRealtime()
         startTimer()
+        startInfoUpdates()
 
         fusedClient.requestLocationUpdates(
             locationRequest, locationCallback, Looper.getMainLooper()
@@ -143,9 +154,16 @@ class LocationTrackingService : Service() {
         startElapsed += (SystemClock.elapsedRealtime() - segmentStart) / 1000
         timerJob?.cancel()
         timerJob = null
+        infoJob?.cancel()
+        infoJob = null
         gpsStatus.value = "Tracking paused"
         lastLocation = null
         lastFixTime = 0L
+        // Clear road context so stale data isn't shown while stopped.
+        roadName.value = ""
+        roadMaxSpeedKmh.value = -1.0
+        restAreaName.value = ""
+        restAreaDistanceKm.value = -1.0
         // No more GPS readings will arrive while paused, and the alarm is only
         // cleared by an incoming reading — so silence it explicitly here.
         stopAlertLoop()
@@ -188,6 +206,34 @@ class LocationTrackingService : Service() {
                     stopAlertLoop()
                 }
                 delay(1000)
+            }
+        }
+    }
+
+    // Periodically refreshes road name + speed limit (every ~15 s) and the nearest
+    // rest area (every ~90 s) from OpenStreetMap while tracking. Fails soft.
+    private fun startInfoUpdates() {
+        infoJob?.cancel()
+        infoJob = scope.launch {
+            var tick = 0
+            while (isTracking.value) {
+                val loc = lastLocation
+                if (loc != null) {
+                    val info = try { osm.fetchRoadInfo(loc.latitude, loc.longitude) } catch (_: Exception) { null }
+                    if (info != null) {
+                        roadName.value = info.name ?: ""
+                        roadMaxSpeedKmh.value = info.maxSpeedKmh ?: -1.0
+                    }
+                    if (tick % 6 == 0) {
+                        val ra = try { osm.fetchNearestRestArea(loc.latitude, loc.longitude) } catch (_: Exception) { null }
+                        if (ra != null) {
+                            restAreaName.value = ra.name ?: ""
+                            restAreaDistanceKm.value = ra.distanceKm
+                        }
+                    }
+                }
+                tick++
+                delay(15_000)
             }
         }
     }
@@ -356,6 +402,7 @@ class LocationTrackingService : Service() {
         super.onDestroy()
         fusedClient.removeLocationUpdates(locationCallback)
         timerJob?.cancel()
+        infoJob?.cancel()
         alertJob?.cancel()
         toneGen?.release()
         scope.cancel()

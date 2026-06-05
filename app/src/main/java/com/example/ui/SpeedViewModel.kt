@@ -51,6 +51,14 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
     val alertSoundEnabled: StateFlow<Boolean> = _alertSoundEnabled.asStateFlow()
     private val _savedTrips = MutableStateFlow<List<Trip>>(emptyList())
     val savedTrips: StateFlow<List<Trip>> = _savedTrips.asStateFlow()
+    private val _roadName = MutableStateFlow("")
+    val roadName: StateFlow<String> = _roadName.asStateFlow()
+    private val _roadMaxSpeedKmh = MutableStateFlow(-1.0)
+    val roadMaxSpeedKmh: StateFlow<Double> = _roadMaxSpeedKmh.asStateFlow()
+    private val _restAreaName = MutableStateFlow("")
+    val restAreaName: StateFlow<String> = _restAreaName.asStateFlow()
+    private val _restAreaDistanceKm = MutableStateFlow(-1.0)
+    val restAreaDistanceKm: StateFlow<Double> = _restAreaDistanceKm.asStateFlow()
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -92,6 +100,10 @@ class SpeedViewModel(app: Application) : AndroidViewModel(app) {
         mirrorFlow(svc.speedUnit, _speedUnit)
         mirrorFlow(svc.alertSoundEnabled, _alertSoundEnabled)
         mirrorFlow(svc.savedTrips, _savedTrips)
+        mirrorFlow(svc.roadName, _roadName)
+        mirrorFlow(svc.roadMaxSpeedKmh, _roadMaxSpeedKmh)
+        mirrorFlow(svc.restAreaName, _restAreaName)
+        mirrorFlow(svc.restAreaDistanceKm, _restAreaDistanceKm)
     }
 
     // --- Pass-through actions ---

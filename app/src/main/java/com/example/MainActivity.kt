@@ -179,6 +179,10 @@ fun SpeedometerAppRoot(
         val speedUnit by viewModel.speedUnit.collectAsStateWithLifecycle()
         val savedTrips by viewModel.savedTrips.collectAsStateWithLifecycle()
         val alertSoundEnabled by viewModel.alertSoundEnabled.collectAsStateWithLifecycle()
+        val roadName by viewModel.roadName.collectAsStateWithLifecycle()
+        val roadMaxSpeedKmh by viewModel.roadMaxSpeedKmh.collectAsStateWithLifecycle()
+        val restAreaName by viewModel.restAreaName.collectAsStateWithLifecycle()
+        val restAreaDistanceKm by viewModel.restAreaDistanceKm.collectAsStateWithLifecycle()
 
         val isMph = speedUnit == "mph"
         val displaySpeed = if (isMph) currentSpeedKmh * 0.621371 else currentSpeedKmh
@@ -188,6 +192,22 @@ fun SpeedometerAppRoot(
         val distanceUnitLabel = if (isMph) "mi" else "km"
         val speedUnitLabel = if (isMph) "mph" else "km/h"
         val isAlertTriggered = speedLimit > 0 && displaySpeed > speedLimit.toDouble()
+
+        // --- Road context (OpenStreetMap) display strings ---
+        val roadLimitText = if (roadMaxSpeedKmh > 0) {
+            val v = if (isMph) roadMaxSpeedKmh * 0.621371 else roadMaxSpeedKmh
+            Math.round(v).toString()
+        } else "—"
+        val restAreaText = if (restAreaDistanceKm >= 0.0) {
+            val d = if (isMph) restAreaDistanceKm * 0.621371 else restAreaDistanceKm
+            val distStr = String.format(java.util.Locale.getDefault(), "%.1f %s", d, distanceUnitLabel)
+            val etaStr = if (currentSpeedKmh > 1.0) {
+                val mins = (restAreaDistanceKm / currentSpeedKmh) * 60.0
+                " · ~${Math.round(mins)} min"
+            } else ""
+            val namePrefix = if (restAreaName.isNotBlank()) "$restAreaName · " else ""
+            namePrefix + distStr + etaStr
+        } else if (isTracking) "Searching nearby…" else "—"
 
         // --- Reusable content blocks so both layouts share the same pieces ---
         val header: @Composable () -> Unit = {
@@ -221,6 +241,14 @@ fun SpeedometerAppRoot(
                 gpsStatus = gpsStatus,
                 isTracking = isTracking,
                 bigMode = isWide,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+            RoadInfoPanel(
+                roadName = roadName,
+                speedLimitText = roadLimitText,
+                speedLimitUnit = speedUnitLabel,
+                restText = restAreaText,
+                isTracking = isTracking,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
             AnimatedVisibility(
@@ -608,6 +636,116 @@ fun SpeedAlertBanner(
                 fontWeight = FontWeight.Bold,
                 fontSize = 14.sp,
                 textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+fun RoadInfoPanel(
+    roadName: String,
+    speedLimitText: String,
+    speedLimitUnit: String,
+    restText: String,
+    isTracking: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = SlateNavy),
+        shape = RoundedCornerShape(16.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .border(1.dp, SlateSteel.copy(alpha = 0.6f), RoundedCornerShape(16.dp))
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            // Current road + posted speed limit sign
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Place,
+                    contentDescription = "Road",
+                    tint = AccentCyan,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Current road",
+                        color = TextMuted,
+                        fontSize = 11.sp
+                    )
+                    Text(
+                        text = when {
+                            roadName.isNotBlank() -> roadName
+                            isTracking -> "Locating…"
+                            else -> "—"
+                        },
+                        color = TextWhite,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 15.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(Color.White)
+                            .border(3.dp, AccentRed, CircleShape)
+                    ) {
+                        Text(
+                            text = speedLimitText,
+                            color = Color.Black,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = if (speedLimitText.length > 2) 13.sp else 17.sp
+                        )
+                    }
+                    Text(
+                        text = speedLimitUnit,
+                        color = TextMuted,
+                        fontSize = 9.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+            HorizontalDivider(color = SlateSteel.copy(alpha = 0.4f))
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Next rest / service area
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.LocalParking,
+                    contentDescription = "Rest area",
+                    tint = AccentGold,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Next rest area",
+                        color = TextMuted,
+                        fontSize = 11.sp
+                    )
+                    Text(
+                        text = restText,
+                        color = TextWhite,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 14.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Road data: OpenStreetMap · approximate, may be unavailable",
+                color = TextMuted.copy(alpha = 0.6f),
+                fontSize = 9.sp
             )
         }
     }
