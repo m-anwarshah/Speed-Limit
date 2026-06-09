@@ -17,6 +17,9 @@ import android.os.Build
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.data.Trip
@@ -91,6 +94,17 @@ class LocationTrackingService : Service() {
     private var alertActive = false
     private var alertJob: Job? = null
     private var toneGen: ToneGenerator? = null
+    private var currentToneVolume = -1
+    private var overLimitCount = 0
+    private var isVibrating = false
+    private val vibrator: Vibrator? by lazy {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager)?.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        }
+    }
 
     private val osm = OsmRepository()
 
@@ -166,7 +180,9 @@ class LocationTrackingService : Service() {
         restAreaDistanceKm.value = -1.0
         // No more GPS readings will arrive while paused, and the alarm is only
         // cleared by an incoming reading — so silence it explicitly here.
+        overLimitCount = 0
         stopAlertLoop()
+        stopVibrate()
         stopForeground(STOP_FOREGROUND_REMOVE)
         // End the "started" state so the service doesn't linger in the background.
         // While the app is open it stays alive via the binding (state is preserved);
@@ -247,22 +263,28 @@ class LocationTrackingService : Service() {
         var meters = 0.0
         var secs = 0.0
 
+        val accurate = accuracy <= DISTANCE_ACCURACY_THRESHOLD_M
         lastLocation?.let { prev ->
             meters = prev.distanceTo(loc).toDouble()
             secs = (loc.time - prev.time) / 1000.0
-            if (meters > 0 && secs > 0 && (!loc.hasSpeed() || speedMps <= 0.0)) {
-                speedMps = meters / secs
+            // Derive speed from movement only when the fix is accurate. With the
+            // screen off / battery saver on, low-accuracy fixes make the position
+            // "jump", which would otherwise look like a burst of speed and trip the
+            // alarm while the phone is actually sitting still.
+            if (secs > 0 && (!loc.hasSpeed() || speedMps <= 0.0)) {
+                speedMps = if (accurate) meters / secs else 0.0
             }
         }
         lastLocation = loc
 
         if (speedMps < 0) speedMps = 0.0
         var kmh = speedMps * 3.6
-        if (kmh < MIN_SPEED_KMH) kmh = 0.0   // suppress GPS jitter at standstill
+        if (kmh > MAX_PLAUSIBLE_KMH) kmh = 0.0   // discard impossible GPS spikes
+        if (kmh < MIN_SPEED_KMH) kmh = 0.0       // suppress jitter at standstill
 
         // Only accumulate distance for accurate fixes while actually moving, so a
         // parked phone's GPS drift doesn't silently add kilometres over time.
-        if (kmh > 0.0 && secs > 0 && accuracy <= DISTANCE_ACCURACY_THRESHOLD_M) {
+        if (kmh > 0.0 && secs > 0 && accurate) {
             distanceKm.value += meters / 1000.0
         }
 
@@ -279,14 +301,26 @@ class LocationTrackingService : Service() {
 
     private fun checkAlert(currentKmh: Double) {
         val limit = speedLimit.value
-        if (limit <= 0) { stopAlertLoop(); return }
+        if (limit <= 0) { overLimitCount = 0; stopAlertLoop(); stopVibrate(); return }
         val displaySpeed = if (speedUnit.value == "mph") currentKmh * 0.621371 else currentKmh
         val over = displaySpeed > limit
 
-        if (over && alertSoundEnabled.value) {
-            startAlertLoop()   // keep beeping until back under the limit
+        // Debounce: require a few consecutive over-limit readings before alerting,
+        // so a single bad/jumpy GPS fix can't trigger a false alarm.
+        overLimitCount = if (over) overLimitCount + 1 else 0
+        val confirmedOver = overLimitCount >= ALERT_CONFIRM_READINGS
+
+        if (confirmedOver) {
+            if (alertSoundEnabled.value) {
+                stopVibrate()
+                startAlertLoop()   // escalating beep until back under the limit
+            } else {
+                stopAlertLoop()
+                startVibrate()     // sound is off → vibrate instead
+            }
         } else {
             stopAlertLoop()
+            stopVibrate()
         }
     }
 
@@ -296,11 +330,20 @@ class LocationTrackingService : Service() {
         if (alertJob?.isActive == true) return
         alertActive = true
         alertJob = scope.launch {
+            var volume = ALERT_START_VOLUME
             try {
-                if (toneGen == null) toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 90)
                 while (alertActive) {
+                    // Ramp the beep from quiet to loud, then hold at full volume.
+                    // A ToneGenerator's volume is fixed per instance, so while ramping
+                    // we recreate it at the new volume.
+                    if (toneGen == null || volume != currentToneVolume) {
+                        toneGen?.release()
+                        toneGen = ToneGenerator(AudioManager.STREAM_ALARM, volume)
+                        currentToneVolume = volume
+                    }
                     toneGen?.startTone(ToneGenerator.TONE_CDMA_HIGH_L, 400)
                     delay(700) // beep ~every 0.7s
+                    if (volume < 100) volume = (volume + ALERT_VOLUME_STEP).coerceAtMost(100)
                 }
             } catch (_: Exception) {}
         }
@@ -313,6 +356,28 @@ class LocationTrackingService : Service() {
         try { toneGen?.stopTone() } catch (_: Exception) {}
     }
 
+    private fun startVibrate() {
+        if (isVibrating) return
+        val v = vibrator ?: return
+        // Repeating buzz: vibrate 450 ms, pause 350 ms, repeat from index 0.
+        val pattern = longArrayOf(0, 450, 350)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                v.vibrate(VibrationEffect.createWaveform(pattern, 0))
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(pattern, 0)
+            }
+            isVibrating = true
+        } catch (_: Exception) {}
+    }
+
+    private fun stopVibrate() {
+        if (!isVibrating) return
+        try { vibrator?.cancel() } catch (_: Exception) {}
+        isVibrating = false
+    }
+
     // --- Settings ---
     fun setSpeedLimit(v: Int) {
         val c = v.coerceIn(0, 400); speedLimit.value = c; repo.saveSpeedLimit(c)
@@ -321,13 +386,9 @@ class LocationTrackingService : Service() {
     fun setAlertSoundEnabled(e: Boolean) {
         alertSoundEnabled.value = e
         repo.saveAlertSound(e)
-        if (!e) {
-            stopAlertLoop()
-        } else {
-            // If we're already over the limit when sound is switched back on, start
-            // the alarm right away instead of waiting for the next GPS fix.
-            checkAlert(currentSpeedKmh.value)
-        }
+        // Re-evaluate immediately so we switch between beep and vibrate (or silence)
+        // without waiting for the next GPS fix.
+        checkAlert(currentSpeedKmh.value)
     }
 
     // --- Trip history ---
@@ -404,6 +465,7 @@ class LocationTrackingService : Service() {
         timerJob?.cancel()
         infoJob?.cancel()
         alertJob?.cancel()
+        stopVibrate()
         toneGen?.release()
         scope.cancel()
     }
@@ -416,7 +478,14 @@ class LocationTrackingService : Service() {
         private const val GPS_TIMEOUT_MS = 5000L
         // Speeds below this (km/h) are treated as standstill jitter and shown as 0.
         private const val MIN_SPEED_KMH = 1.0
-        // Fixes worse than this accuracy (metres) don't contribute to distance.
+        // Fixes worse than this accuracy (metres) don't contribute to distance/speed.
         private const val DISTANCE_ACCURACY_THRESHOLD_M = 25.0
+        // Speeds above this (km/h) are treated as GPS spikes and discarded.
+        private const val MAX_PLAUSIBLE_KMH = 360.0
+        // Consecutive over-limit readings required before the alarm sounds (debounce).
+        private const val ALERT_CONFIRM_READINGS = 2
+        // Beep volume ramps from this up to 100 (ToneGenerator's 0–100 scale).
+        private const val ALERT_START_VOLUME = 35
+        private const val ALERT_VOLUME_STEP = 12
     }
 }

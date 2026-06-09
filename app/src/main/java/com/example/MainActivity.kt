@@ -2,10 +2,12 @@ package com.example
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -142,6 +144,59 @@ fun SpeedometerAppRoot(
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // One-time, optional nudge to let the app run without battery restrictions, so
+    // background tracking isn't throttled with the screen off. Uses the settings
+    // redirect (no restricted permission), per Google Play policy.
+    var showBatteryPrompt by remember { mutableStateOf(false) }
+    LaunchedEffect(hasPermission) {
+        if (hasPermission) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+            val prefs = context.getSharedPreferences("speedmeter_ui", Context.MODE_PRIVATE)
+            val dismissed = prefs.getBoolean("battery_prompt_dismissed", false)
+            showBatteryPrompt = !pm.isIgnoringBatteryOptimizations(context.packageName) && !dismissed
+        }
+    }
+    if (showBatteryPrompt) {
+        AlertDialog(
+            onDismissRequest = { showBatteryPrompt = false },
+            title = { Text("Allow unrestricted battery use?") },
+            text = {
+                Text(
+                    "For uninterrupted speed tracking while the screen is off, allow SpeedMeter to run " +
+                        "without battery restrictions. Otherwise your phone's battery saver can pause GPS " +
+                        "in the background. This is optional — the app still works without it."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    context.getSharedPreferences("speedmeter_ui", Context.MODE_PRIVATE)
+                        .edit().putBoolean("battery_prompt_dismissed", true).apply()
+                    showBatteryPrompt = false
+                    try {
+                        context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                    } catch (_: Exception) {
+                        try {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.fromParts("package", context.packageName, null)
+                                )
+                            )
+                        } catch (_: Exception) {
+                        }
+                    }
+                }) { Text("Open settings") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    context.getSharedPreferences("speedmeter_ui", Context.MODE_PRIVATE)
+                        .edit().putBoolean("battery_prompt_dismissed", true).apply()
+                    showBatteryPrompt = false
+                }) { Text("Not now") }
+            }
+        )
     }
 
     // Location + (on Android 13+) notification permission for the foreground service.
